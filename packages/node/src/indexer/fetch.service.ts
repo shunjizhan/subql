@@ -43,14 +43,13 @@ const BLOCK_TIME_VARIANCE = 5;
 const DICTIONARY_MAX_QUERY_SIZE = 10000;
 const { argv } = getYargsOption();
 
-const fetchBlocksBatches: typeof SubstrateUtil.fetchBlocksBatches =
-  argv.profiler
-    ? profilerWrap(
-        SubstrateUtil.fetchBlocksBatches,
-        'SubstrateUtil',
-        'fetchBlocksBatches',
-      )
-    : SubstrateUtil.fetchBlocksBatches;
+const fetchBlocksBatches = argv.profiler
+  ? profilerWrap(
+      SubstrateUtil.fetchBlocksBatches,
+      'SubstrateUtil',
+      'fetchBlocksBatches',
+    )
+  : SubstrateUtil.fetchBlocksBatches;
 
 function eventFilterToQueryEntry(
   filter: SubqlEventFilter,
@@ -87,6 +86,7 @@ export class FetchService implements OnApplicationShutdown {
   private latestProcessedHeight: number;
   private latestBufferedHeight: number;
   private blockBuffer: AutoQueue<void>;
+  private blockBufferSubscription?: () => void;
   private isShutdown = false;
   private parentSpecVersion: number;
   private useDictionary: boolean;
@@ -105,6 +105,8 @@ export class FetchService implements OnApplicationShutdown {
 
   onApplicationShutdown(): void {
     this.isShutdown = true;
+    this.blockBuffer.abort();
+    this.blockBufferSubscription?.();
   }
 
   get api(): ApiPromise {
@@ -237,25 +239,45 @@ export class FetchService implements OnApplicationShutdown {
 
     let isFetchingBlocks = false;
 
-    // Setup initial blocks
+    // Resolves on shutdown or rejects on error
+    const task = new Promise<void>((resolve, reject) => {
+      // Monitor queue size to replenish
+      const sub = this.blockBuffer.on('size', async (size) => {
+        try {
+          if (this.isShutdown) {
+            resolve();
+            return;
+          }
+          if (this.blockBuffer.freeSpace < this.nodeConfig.batchSize) return;
+          if (isFetchingBlocks) return;
+
+          isFetchingBlocks = true;
+
+          await this.queueBlocks(initBlockHeight, processor);
+
+          isFetchingBlocks = false;
+
+          this.eventEmitter.emit(IndexerEvent.BlockQueueSize, {
+            value: size,
+          });
+        } catch (e) {
+          logger.error(e, `Failed to enqueue blocks for processing`);
+          // TODO should blockBufferSubscription be cleaned up
+          reject(e);
+          sub();
+        }
+      });
+
+      this.blockBufferSubscription = () => {
+        sub();
+        resolve();
+      };
+    });
+
+    // Load initial blocks
     await this.queueBlocks(initBlockHeight, processor);
 
-    // Monitor queue size to replenish
-    this.blockBuffer.on('size', async (size) => {
-      if (this.isShutdown) return;
-      if (this.blockBuffer.freeSpace < this.nodeConfig.batchSize) return;
-      if (isFetchingBlocks) return;
-
-      isFetchingBlocks = true;
-
-      await this.queueBlocks(initBlockHeight, processor);
-
-      isFetchingBlocks = false;
-
-      this.eventEmitter.emit(IndexerEvent.BlockQueueSize, {
-        value: size,
-      });
-    });
+    return task;
   }
 
   private async queueBlocks(
@@ -264,20 +286,32 @@ export class FetchService implements OnApplicationShutdown {
   ): Promise<void> {
     const bufferBlocks = await this.nextBlocks(initBlockHeight);
 
-    const metadataChanged = await this.fetchMeta(
-      bufferBlocks[bufferBlocks.length - 1],
-    );
+    if (!bufferBlocks.length) {
+      logger.info('No blocks to queue');
+      return;
+    }
 
+    const highestBufferBlock = bufferBlocks[bufferBlocks.length - 1];
+    const metadataChanged = await this.fetchMeta(highestBufferBlock);
+
+    logger.info(
+      `fetch block [${bufferBlocks[0]},${highestBufferBlock}], total ${bufferBlocks.length} blocks`,
+    );
     const blocks = await fetchBlocksBatches(
       this.api,
       bufferBlocks,
       metadataChanged ? undefined : this.parentSpecVersion,
     );
-    logger.info(
-      `fetch block [${bufferBlocks[0]},${
-        bufferBlocks[bufferBlocks.length - 1]
-      }], total ${bufferBlocks.length} blocks`,
-    );
+
+    this.eventEmitter.emit(IndexerEvent.BlockBufferHeight, {
+      value: highestBufferBlock,
+    });
+
+    if (!blocks) {
+      // This happens with spec tests
+      logger.warn('Fetching blocks result is undefined');
+      return;
+    }
 
     this.blockBuffer.putMany(
       blocks.map((block) => async () => {
@@ -324,7 +358,6 @@ export class FetchService implements OnApplicationShutdown {
               dictionary._metadata.lastProcessedHeight,
             ),
           );
-          return [];
         } else {
           this.setLatestBufferedHeight(batchBlocks[batchBlocks.length - 1]);
           return batchBlocks;
